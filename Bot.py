@@ -9,6 +9,7 @@ Commands (work in your own Saved Messages / any admin PM with yourself):
   /setsticker        Reply to a sticker to save it as the default sticker to post after anime info cards.
   /resume            Resume a batch that was interrupted (e.g. by a flood wait).
   /status            Show current progress of an in-progress batch, if any.
+  /report            Retrieve the report for the current or last saved batch.
   /cancel            Discard the current active batch.
 """
 
@@ -108,6 +109,28 @@ def load_saved_sticker():
 
 
 # ---------------------------------------------------------------------------
+# Helper: Send long messages safely by chunking
+# ---------------------------------------------------------------------------
+
+async def send_long_message(event, text):
+    max_length = 4000
+    if len(text) <= max_length:
+        await event.respond(text)
+        return
+    
+    lines = text.splitlines()
+    chunk = ""
+    for line in lines:
+        if len(chunk) + len(line) + 1 > max_length:
+            await event.respond(chunk.strip())
+            chunk = line + "\n"
+        else:
+            chunk += line + "\n"
+    if chunk.strip():
+        await event.respond(chunk.strip())
+
+
+# ---------------------------------------------------------------------------
 # Robust List Parser & Command Formatting
 # ---------------------------------------------------------------------------
 
@@ -120,16 +143,13 @@ def parse_list(text):
         if not line:
             continue
             
-        # Ignore horizontal borders (any line consisting mostly of dashes/box-drawing characters)
         if set(line).issubset({"─", "-", "_", "═", "━"}):
             continue
             
-        # Clean up line from formatting markers like emojis, bullet points, and '🔗'
         cleaned = re.sub(r"^[•\-\*➢•\s🔗]+", "", line).strip()
         if not cleaned:
             continue
             
-        # Check if line is a day header
         if cleaned.lower() in DAY_NAMES:
             current_day = cleaned.capitalize()
             continue
@@ -176,7 +196,6 @@ def format_report(items, admin_usernames):
         
     report_text = "\n".join(lines).strip()
     
-    # Append batch summary details at the very end
     if admin_usernames:
         report_text += f"\n🛡 Added Admins: {', '.join(admin_usernames)}"
     report_text += "\n📤 Anime info card & sticker successfully posted anonymously!"
@@ -331,7 +350,7 @@ async def execute_anime_automation(target_group_entity, anime_name, channel_enti
 
 
 # ---------------------------------------------------------------------------
-# Batch processing loop (Silent individual steps, summary at the end)
+# Batch processing loop
 # ---------------------------------------------------------------------------
 
 async def process_batch(event, state):
@@ -421,7 +440,8 @@ async def process_batch(event, state):
     
     report = format_report(state["items"], admin_usernames)
     logger.info("Batch processing complete!")
-    await event.respond("🎉 **Batch processing complete!**\n\n" + report)
+    await event.respond("🎉 **Batch processing complete!**")
+    await send_long_message(event, report)
     clear_state()
 
 
@@ -595,6 +615,21 @@ async def status_cmd(event):
     await event.respond(f"Progress: {done}/{total} completed.")
 
 
+@client.on(events.NewMessage(pattern=r"/report$"))
+async def report_cmd(event):
+    if not is_owner(event):
+        return
+    state = load_state()
+    if not state or not state.get("items"):
+        await event.respond("❌ No batch report found in state.")
+        return
+    
+    admin_usernames = state.get("admin_usernames", [])
+    report = format_report(state["items"], admin_usernames)
+    await event.respond("📋 **Retrieved Batch Report:**")
+    await send_long_message(event, report)
+
+
 @client.on(events.NewMessage(pattern=r"/cancel$"))
 async def cancel_cmd(event):
     if not is_owner(event):
@@ -617,7 +652,7 @@ async def main():
     logger.info(f"Logged in as {me.first_name} (id={me.id})")
     if OWNER_ID is None:
         logger.warning(f"OWNER_ID is not set. Your user ID is {me.id}")
-    logger.info("Bot is running and ready.")
+    logger.info("Is ready.")
     await client.run_until_disconnected()
 
 
