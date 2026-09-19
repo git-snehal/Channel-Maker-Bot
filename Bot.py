@@ -184,21 +184,11 @@ async def create_one_channel(name, is_private):
 
 async def promote_admins_to_channel(channel_entity, admin_usernames):
     promoted = []
-    admin_rights = ChatAdminRights(
-        change_info=True,
-        post_messages=True,
-        edit_messages=True,
-        delete_messages=True,
-        ban_users=True,
-        invite_users=True,
-        pin_messages=True,
-        add_admins=False
-    )
-
     for username in admin_usernames:
         try:
             user_entity = await client.get_entity(username)
-            # Bots can only be added to channels as admins directly via EditAdminRequest
+            
+            # Ensure the bot/user is invited to the channel first
             try:
                 await client(InviteToChannelRequest(
                     channel=channel_entity,
@@ -207,15 +197,21 @@ async def promote_admins_to_channel(channel_entity, admin_usernames):
             except Exception:
                 pass  # May fail if already a participant, which is fine
 
-            # Convert user entity to correct input entity for channel-specific context
-            input_user = await client.get_input_entity(user_entity)
-
-            await client(EditAdminRequest(
-                channel=channel_entity,
-                user_id=input_user,
-                admin_rights=admin_rights,
+            # Use Telethon's built-in high-level helper which handles input casting safely
+            await client.edit_admin(
+                entity=channel_entity,
+                user=user_entity,
+                is_admin=True,
+                change_info=True,
+                post_messages=True,
+                edit_messages=True,
+                delete_messages=True,
+                ban_users=True,
+                invite_users=True,
+                pin_messages=True,
+                add_admins=False,
                 rank="Admin"
-            ))
+            )
             promoted.append(username)
         except Exception as e:
             print(f"Failed to add {username} as admin: {e}")
