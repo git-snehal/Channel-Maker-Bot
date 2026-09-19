@@ -108,20 +108,34 @@ def load_saved_sticker():
 
 
 # ---------------------------------------------------------------------------
-# Parsing list & Formatting Commands
+# Robust List Parser & Command Formatting
 # ---------------------------------------------------------------------------
 
 def parse_list(text):
     items = []
     current_day = None
+    
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line:
             continue
-        if line.lower() in DAY_NAMES:
-            current_day = line.capitalize()
+            
+        # Ignore horizontal borders (any line consisting mostly of dashes/box-drawing characters)
+        if set(line).issubset({"─", "-", "_", "═", "━"}):
             continue
-        items.append({"day": current_day, "name": line})
+            
+        # Clean up line from formatting markers like emojis, bullet points, and '🔗'
+        cleaned = re.sub(r"^[•\-\*➢•\s🔗]+", "", line).strip()
+        if not cleaned:
+            continue
+            
+        # Check if line is a day header
+        if cleaned.lower() in DAY_NAMES:
+            current_day = cleaned.capitalize()
+            continue
+            
+        items.append({"day": current_day, "name": cleaned})
+        
     return items
 
 
@@ -138,9 +152,10 @@ def generate_anime_commands(full_id, name):
     ]
 
 
-def format_report(items):
+def format_report(items, admin_usernames):
     lines = []
     last_day = object()
+    
     for item in items:
         if item["status"] != "done":
             continue
@@ -148,16 +163,25 @@ def format_report(items):
             if lines:
                 lines.append("")
             if item["day"]:
-                lines.append(item["day"])
+                lines.append(f"🔗 {item['day']}")
+                lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
             last_day = item["day"]
-        lines.append(item["name"])
-        lines.extend(item.get("commands", []))
+            
+        lines.append(f"• {item['name']}")
+        for cmd in item.get("commands", []):
+            lines.append(cmd)
         if item.get("invite_link"):
             lines.append(f"Invite: {item['invite_link']}")
-        if item.get("admin_notes"):
-            lines.append(f"Admins: {item['admin_notes']}")
         lines.append("")
-    return "\n".join(lines).strip()
+        
+    report_text = "\n".join(lines).strip()
+    
+    # Append batch summary details at the very end
+    if admin_usernames:
+        report_text += f"\n🛡 Added Admins: {', '.join(admin_usernames)}"
+    report_text += "\n📤 Anime info card & sticker successfully posted anonymously!"
+    
+    return report_text
 
 
 # ---------------------------------------------------------------------------
@@ -184,7 +208,6 @@ async def create_one_channel(name, is_private):
 
 async def promote_admins_to_channel(channel_entity, admin_usernames):
     promoted = []
-    # Fully enabled administrator rights including Manage Direct Messages (other=True)
     admin_rights = ChatAdminRights(
         change_info=True,
         post_messages=True,
@@ -195,7 +218,7 @@ async def promote_admins_to_channel(channel_entity, admin_usernames):
         pin_messages=True,
         add_admins=True,
         manage_call=True,
-        other=True  # Enables Manage Direct Messages & Welcome Messages
+        other=True
     )
 
     input_channel = await client.get_input_entity(channel_entity)
@@ -221,27 +244,22 @@ async def promote_admins_to_channel(channel_entity, admin_usernames):
                 rank="Admin"
             ))
             promoted.append(username)
-            await asyncio.sleep(2)  # Pause between admin promotions
+            await asyncio.sleep(2)
         except Exception as e:
             logger.error(f"Failed to add {username} as admin: {e}")
     return promoted
 
 
 # ---------------------------------------------------------------------------
-# Automated Search & Forward Sequence (Slowed & Safe)
+# Automated Search & Forward Sequence
 # ---------------------------------------------------------------------------
 
 async def execute_anime_automation(target_group_entity, anime_name, channel_entity):
-    """
-    Sends /a <anime_name> to the target group slowly, polls for response,
-    clicks the button, waits safely, forwards anonymously, and sends sticker.
-    """
     try:
         logger.info(f"Automation: Sending search query for '{anime_name}'")
         sent_msg = await client.send_message(target_group_entity, f"/a {anime_name}")
-        await asyncio.sleep(3)  # Gentle wait for bot response
+        await asyncio.sleep(3)
         
-        # Poll for inline keyboard response message
         target_msg = None
         for _ in range(16):
             await asyncio.sleep(0.7)
@@ -257,7 +275,6 @@ async def execute_anime_automation(target_group_entity, anime_name, channel_enti
             logger.warning(f"Automation: Could not find inline result message for '{anime_name}'")
             return False
 
-        # Click matching button
         button_clicked = False
         for row in target_msg.reply_markup.rows:
             for button in row.buttons:
@@ -277,9 +294,8 @@ async def execute_anime_automation(target_group_entity, anime_name, channel_enti
             return False
 
         logger.info(f"Automation: Clicked button for '{anime_name}', waiting for info card...")
-        await asyncio.sleep(4)  # Wait for search bot to generate info card
+        await asyncio.sleep(4)
 
-        # Poll for final info card
         info_card_msg = None
         for _ in range(20):
             await asyncio.sleep(0.7)
@@ -315,7 +331,7 @@ async def execute_anime_automation(target_group_entity, anime_name, channel_enti
 
 
 # ---------------------------------------------------------------------------
-# Batch processing loop
+# Batch processing loop (Silent individual steps, summary at the end)
 # ---------------------------------------------------------------------------
 
 async def process_batch(event, state):
@@ -349,23 +365,14 @@ async def process_batch(event, state):
                 if admin_usernames:
                     promoted = await promote_admins_to_channel(channel_entity, admin_usernames)
 
-                automation_success = False
                 if target_group_entity:
-                    await event.respond(f"🔍 Automating search & post for: {name}...")
-                    automation_success = await execute_anime_automation(target_group_entity, name, channel_entity)
+                    await execute_anime_automation(target_group_entity, name, channel_entity)
 
                 item["status"] = "done"
                 item["channel_id"] = full_id
                 item["commands"] = commands
                 item["invite_link"] = invite_link
                 item["admin_notes"] = ", ".join(promoted) if promoted else "None"
-                
-                msg = f"✅ Created & Posted: {name}\n" + "\n".join(commands) + f"\nInvite: {invite_link}"
-                if promoted:
-                    msg += f"\n🛡 Added Admins: {', '.join(promoted)}"
-                if automation_success:
-                    msg += f"\n📤 Anime info card & sticker successfully posted anonymously!"
-                await event.respond(msg)
 
             elif mode == "addadmin":
                 channel_entity = await client.get_entity(name)
@@ -373,7 +380,6 @@ async def process_batch(event, state):
 
                 item["status"] = "done"
                 item["admin_notes"] = ", ".join(promoted) if promoted else "None"
-                await event.respond(f"✅ Processed channel '{name}': Added admins -> {item['admin_notes']}")
 
         except FloodWaitError as e:
             wait_seconds = e.seconds
@@ -389,7 +395,6 @@ async def process_batch(event, state):
 
         except Exception as e:
             logger.error(f"Error processing '{name}': {e}")
-            await event.respond(f"❌ Error processing '{name}': {e}")
             continue
 
         created_since_cooldown += 1
@@ -413,9 +418,10 @@ async def process_batch(event, state):
 
     state["active"] = False
     save_state(state)
-    report = format_report(state["items"])
+    
+    report = format_report(state["items"], admin_usernames)
     logger.info("Batch processing complete!")
-    await event.respond("🎉 Batch processing complete!\n\n" + report)
+    await event.respond("🎉 **Batch processing complete!**\n\n" + report)
     clear_state()
 
 
@@ -559,7 +565,7 @@ async def wizard_responses(event):
         state["awaiting_list"] = False
         save_state(state)
 
-        await event.respond(f"Starting batch of {len(items)} item(s) safely with slow delays...")
+        await event.respond(f"🚀 Starting batch of {len(items)} anime channel(s) safely with slow pacing. I will send the final summary report when complete.")
         await process_batch(event, state)
 
 
