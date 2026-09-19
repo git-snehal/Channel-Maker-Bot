@@ -4,8 +4,9 @@ Anime Channel Creator Userbot
 
 Commands (work in your own Saved Messages / any admin PM with yourself):
 
-  /makechannel       Start a new batch. Bot asks Private/Public, then Admins, then your anime list.
+  /makechannel       Start a new batch. Bot asks Private/Public, Target Group for /a searches, Admins, then your anime list.
   /addadmin          Start a batch to add specified admins/bots to a list of channels.
+  /setsticker        Reply to a sticker to save it as the default sticker to post after anime info cards.
   /resume            Resume a batch that was interrupted (e.g. by a flood wait).
   /status            Show current progress of an in-progress batch, if any.
   /cancel            Discard the current active batch.
@@ -39,7 +40,7 @@ from telethon.tl.functions.channels import (
     InviteToChannelRequest,
 )
 from telethon.tl.functions.messages import ExportChatInviteRequest
-from telethon.tl.types import ChatAdminRights
+from telethon.tl.types import ChatAdminRights, DocumentAttributeSticker
 
 # ---------------------------------------------------------------------------
 # CONFIG  -- loaded from a .env file (see .env.example) instead of hardcoded
@@ -60,6 +61,7 @@ SESSION_NAME = os.getenv("SESSION_NAME", "anime_channel_bot")
 OWNER_ID = _int_env("OWNER_ID")
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
+STICKER_FILE = os.path.join(os.path.dirname(__file__), "sticker_state.json")
 
 # Delay (seconds) between each channel creation -- randomized within range.
 MIN_DELAY = _int_env("MIN_DELAY", 30)
@@ -104,6 +106,22 @@ def save_state(state):
 def clear_state():
     if os.path.exists(STATE_FILE):
         os.remove(STATE_FILE)
+
+
+def load_saved_sticker():
+    if not os.path.exists(STICKER_FILE):
+        return None
+    try:
+        with open(STICKER_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data.get("sticker_id")
+    except Exception:
+        return None
+
+
+def save_sticker_data(media_dict):
+    with open(STICKER_FILE, "w", encoding="utf-8") as f:
+        json.dump({"sticker_id": media_dict}, f, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +195,7 @@ async def create_one_channel(name, is_private):
 
 async def promote_admins_to_channel(channel_entity, admin_usernames):
     promoted = []
+    # Fully enabled administrator rights
     admin_rights = ChatAdminRights(
         change_info=True,
         post_messages=True,
@@ -185,7 +204,8 @@ async def promote_admins_to_channel(channel_entity, admin_usernames):
         ban_users=True,
         invite_users=True,
         pin_messages=True,
-        add_admins=False
+        add_admins=True,
+        manage_call=True
     )
 
     input_channel = await client.get_input_entity(channel_entity)
@@ -216,6 +236,86 @@ async def promote_admins_to_channel(channel_entity, admin_usernames):
 
 
 # ---------------------------------------------------------------------------
+# Automated Search & Forward Sequence in the Target Group
+# ---------------------------------------------------------------------------
+
+async def execute_anime_automation(target_group_entity, anime_name, channel_entity):
+    """
+    Sends /a <anime_name> to the target group, listens for the inline response buttons,
+    clicks the matching button, waits for the info card to appear, forwards it anonymously
+    to the channel, and sends the saved sticker.
+    """
+    try:
+        # 1. Send search command
+        sent_msg = await client.send_message(target_group_entity, f"/a {anime_name}")
+        
+        # 2. Wait for message reply/buttons from search bot
+        await asyncio.sleep(3)
+        
+        # Fetch recent messages in the group to find the inline buttons message
+        messages = await client.get_messages(target_group_entity, limit=5)
+        target_msg = None
+        for msg in messages:
+            if msg.reply_markup and hasattr(msg.reply_markup, 'rows'):
+                target_msg = msg
+                break
+        
+        if not target_msg:
+            print(f"Could not find inline result for '{anime_name}'")
+            return False
+
+        # 3. Find and click the button that matches the anime name
+        button_to_click = None
+        for row in target_msg.reply_markup.rows:
+            for button in row.buttons:
+                if anime_name.lower() in button.text.lower():
+                    button_to_click = button
+                    break
+            if button_to_click:
+                break
+        
+        # Fallback to the first button if exact name match isn't found
+        if not button_to_click and target_msg.reply_markup.rows:
+            button_to_click = target_msg.reply_markup.rows[0].buttons[0]
+
+        if button_to_click:
+            await target_msg.click(data=button_to_click.data)
+        else:
+            print(f"No clickable button found for '{anime_name}'")
+            return False
+
+        # 4. Wait a few seconds for the other bot to post the final info card
+        await asyncio.sleep(4)
+
+        # 5. Grab the latest message in the group which should be the info card
+        recent_msgs = await client.get_messages(target_group_entity, limit=3)
+        info_card_msg = None
+        for msg in recent_msgs:
+            if msg.id != sent_msg.id and msg.id != target_msg.id:
+                info_card_msg = msg
+                break
+
+        if info_card_msg:
+            # Forward the info card to the newly created channel anonymously (hiding sender ID)
+            await client.forward_messages(channel_entity, info_card_msg, drop_author=True)
+            
+            # Send saved sticker if available
+            saved_sticker = load_saved_sticker()
+            if saved_sticker:
+                try:
+                    await client.send_file(channel_entity, saved_sticker)
+                except Exception as ex:
+                    print(f"Failed to send saved sticker: {ex}")
+            
+            return True
+
+    except Exception as e:
+        print(f"Automation sequence failed for {anime_name}: {e}")
+    
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Batch processing loop
 # ---------------------------------------------------------------------------
 
@@ -224,6 +324,15 @@ async def process_batch(event, state):
     mode = state.get("mode", "makechannel")
     created_since_cooldown = state.get("created_count_since_cooldown", 0)
     admin_usernames = state.get("admin_usernames", [])
+    target_group = state.get("target_group")
+
+    target_group_entity = None
+    if mode == "makechannel" and target_group:
+        try:
+            target_group_entity = await client.get_entity(target_group)
+        except Exception as e:
+            await event.respond(f"❌ Could not resolve target search group '{target_group}': {e}")
+            return
 
     for item in items:
         if item["status"] == "done":
@@ -240,15 +349,23 @@ async def process_batch(event, state):
                 if admin_usernames:
                     promoted = await promote_admins_to_channel(channel_entity, admin_usernames)
 
+                # Execute automated /a search and anonymous forwarding sequence if target group is set
+                automation_success = False
+                if target_group_entity:
+                    await event.respond(f"🔍 Automating search & post for: {name}...")
+                    automation_success = await execute_anime_automation(target_group_entity, name, channel_entity)
+
                 item["status"] = "done"
                 item["channel_id"] = full_id
                 item["commands"] = commands
                 item["invite_link"] = invite_link
                 item["admin_notes"] = ", ".join(promoted) if promoted else "None"
                 
-                msg = f"✅ Created: {name}\n" + "\n".join(commands) + f"\nInvite: {invite_link}"
+                msg = f"✅ Created & Posted: {name}\n" + "\n".join(commands) + f"\nInvite: {invite_link}"
                 if promoted:
                     msg += f"\n🛡 Added Admins: {', '.join(promoted)}"
+                if automation_success:
+                    msg += f"\n📤 Anime info card & sticker successfully posted anonymously!"
                 await event.respond(msg)
 
             elif mode == "addadmin":
@@ -306,6 +423,31 @@ def is_owner(event):
     return OWNER_ID is not None and event.sender_id == OWNER_ID
 
 
+@client.on(events.NewMessage(pattern=r"/setsticker$"))
+async def setsticker_cmd(event):
+    if not is_owner(event):
+        return
+    
+    reply = await event.get_reply_message()
+    if not reply or not reply.media:
+        await event.respond("❌ Please reply to a **sticker** with `/setsticker` to save it.")
+        return
+
+    is_sticker = False
+    if hasattr(reply.media, 'document'):
+        for attr in reply.media.document.attributes:
+            if isinstance(attr, DocumentAttributeSticker):
+                is_sticker = True
+                break
+
+    if not is_sticker:
+        await event.respond("❌ The message you replied to is not a valid sticker.")
+        return
+
+    save_sticker_data(reply.media.to_dict())
+    await event.respond("✅ Default sticker saved successfully! It will now be sent after every anime info card.")
+
+
 @client.on(events.NewMessage(pattern=r"/makechannel$"))
 async def makechannel_cmd(event):
     if not is_owner(event):
@@ -324,8 +466,10 @@ async def makechannel_cmd(event):
         "mode": "makechannel",
         "visibility": None,
         "awaiting_visibility": True,
+        "awaiting_target_group": False,
         "awaiting_admins": False,
         "awaiting_list": False,
+        "target_group": None,
         "admin_usernames": [],
         "items": [],
         "created_count_since_cooldown": 0,
@@ -358,6 +502,7 @@ async def addadmin_command(event):
         "active": True,
         "mode": "addadmin",
         "awaiting_visibility": False,
+        "awaiting_target_group": False,
         "awaiting_admins": False,
         "awaiting_list": True,
         "admin_usernames": admin_usernames,
@@ -381,12 +526,12 @@ async def visibility_reply(event):
 
     state["visibility"] = event.raw_text.strip().lower()
     state["awaiting_visibility"] = False
-    state["awaiting_admins"] = True
+    state["awaiting_target_group"] = True
     save_state(state)
 
     await event.respond(
-        "Got it! Now, which bots or usernames should be added as admins to each channel?\n"
-        "*(Send them separated by spaces like `@Maiilman_robot @Od3nsLinks_bot`, or type `none` if you don't want any)*"
+        "Got it! Now, send the **Group Username or ID** where the bot should send `/a <anime name>` for automated searches.\n"
+        "*(Example: `@myanimegroup` or `-100xxxxxxxxxx`)*"
     )
 
 
@@ -403,7 +548,21 @@ async def wizard_responses(event):
     if not state or not state.get("active"):
         return
 
-    # Step 2b: Capturing Admin Usernames during /makechannel flow
+    # Step 2: Capturing Target Group
+    if state.get("awaiting_target_group"):
+        state["target_group"] = event.raw_text.strip()
+        state["awaiting_target_group"] = False
+        state["awaiting_admins"] = True
+        save_state(state)
+
+        await event.respond(
+            f"✅ Target group recorded: `{state['target_group']}`\n\n"
+            "Now, which bots or usernames should be added as admins to each channel?\n"
+            "*(Send them separated by spaces like `@Maiilman_robot @Od3nsLinks_bot`, or type `none`)*"
+        )
+        return
+
+    # Step 3: Capturing Admin Usernames
     if state.get("awaiting_admins"):
         text = event.raw_text.strip()
         if text.lower() == "none":
@@ -421,7 +580,7 @@ async def wizard_responses(event):
         )
         return
 
-    # Step 3: Capturing the Anime List
+    # Step 4: Capturing the Anime List
     if state.get("awaiting_list"):
         items = parse_list(event.raw_text)
         if not items:
@@ -434,7 +593,7 @@ async def wizard_responses(event):
         state["awaiting_list"] = False
         save_state(state)
 
-        await event.respond(f"Starting batch of {len(items)} item(s)...")
+        await event.respond(f"Starting batch of {len(items)} item(s) with automation...")
         await process_batch(event, state)
 
 
@@ -446,7 +605,7 @@ async def resume_cmd(event):
     if not state or not state.get("active"):
         await event.respond("No in-progress batch to resume.")
         return
-    if state.get("awaiting_visibility") or state.get("awaiting_admins") or state.get("awaiting_list"):
+    if state.get("awaiting_visibility") or state.get("awaiting_target_group") or state.get("awaiting_admins") or state.get("awaiting_list"):
         await event.respond("Batch isn't ready to resume yet -- finish setup first.")
         return
 
