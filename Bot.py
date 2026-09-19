@@ -4,12 +4,12 @@ Anime Channel Creator Userbot
 
 Commands (work in your own Saved Messages / any admin PM with yourself):
 
-  /makechannel     Start a new batch. Bot asks Private/Public, then you paste
-                   your anime list (with optional day headers).
-  /addadmin        Start a batch to add specified admins/bots to a list of channels.
-  /resume          Resume a batch that was interrupted (e.g. by a flood wait).
-  /status          Show current progress of an in-progress batch, if any.
-  /cancel          Discard the current active batch.
+  /makechannel       Start a new batch. Bot asks Private/Public, then you paste
+                     your anime list (with optional day headers).
+  /addadmin          Start a batch to add specified admins/bots to a list of channels.
+  /resume            Resume a batch that was interrupted (e.g. by a flood wait).
+  /status            Show current progress of an in-progress batch, if any.
+  /cancel            Discard the current active batch.
 
 List format example (after /makechannel or /addadmin, once configured):
 
@@ -207,9 +207,12 @@ async def promote_admins_to_channel(channel_entity, admin_usernames):
             except Exception:
                 pass  # May fail if already a participant, which is fine
 
+            # Convert user entity to correct input entity for channel-specific context
+            input_user = await client.get_input_entity(user_entity)
+
             await client(EditAdminRequest(
                 channel=channel_entity,
-                user_id=user_entity,
+                user_id=input_user,
                 admin_rights=admin_rights,
                 rank="Admin"
             ))
