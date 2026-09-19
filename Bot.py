@@ -195,14 +195,12 @@ async def promote_admins_to_channel(channel_entity, admin_usernames):
         add_admins=False
     )
 
-    # Safely get the input channel entity to prevent casting errors
+    # Convert to input channel to prevent casting errors
     input_channel = await client.get_input_entity(channel_entity)
 
     for username in admin_usernames:
         try:
             user_entity = await client.get_entity(username)
-            
-            # Ensure the bot/user is invited to the channel first
             try:
                 await client(InviteToChannelRequest(
                     channel=input_channel,
@@ -211,7 +209,6 @@ async def promote_admins_to_channel(channel_entity, admin_usernames):
             except Exception:
                 pass  # May fail if already a participant, which is fine
 
-            # Safely get the input user entity
             input_user = await client.get_input_entity(user_entity)
 
             await client(EditAdminRequest(
@@ -247,7 +244,6 @@ async def process_batch(event, state):
                     name, state["visibility"] == "private"
                 )
                 
-                # If admins were specified for this makechannel flow, add them too!
                 promoted = []
                 if admin_usernames:
                     promoted = await promote_admins_to_channel(channel_entity, admin_usernames)
@@ -264,7 +260,6 @@ async def process_batch(event, state):
                 await event.respond(msg)
 
             elif mode == "addadmin":
-                # In addadmin mode, 'name' represents the channel name/search query or username/ID if inputted
                 channel_entity = await client.get_entity(name)
                 promoted = await promote_admins_to_channel(channel_entity, admin_usernames)
 
