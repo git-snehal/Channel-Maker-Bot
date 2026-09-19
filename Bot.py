@@ -4,14 +4,13 @@ Anime Channel Creator Userbot
 
 Commands (work in your own Saved Messages / any admin PM with yourself):
 
-  /makechannel       Start a new batch. Bot asks Private/Public, then you paste
-                     your anime list (with optional day headers).
+  /makechannel       Start a new batch. Bot asks Private/Public, then Admins, then your anime list.
   /addadmin          Start a batch to add specified admins/bots to a list of channels.
   /resume            Resume a batch that was interrupted (e.g. by a flood wait).
   /status            Show current progress of an in-progress batch, if any.
   /cancel            Discard the current active batch.
 
-List format example (after /makechannel or /addadmin, once configured):
+List format example (after setup):
 
     Monday
     Black Clover
@@ -19,10 +18,6 @@ List format example (after /makechannel or /addadmin, once configured):
     Cyberpunk
     Tuesday
     Jujutsu Kaisen
-
-Each non-empty line that is NOT recognized as a day header is treated as an
-anime name. Day header recognition is simple: Monday/Tuesday/.../Sunday
-(case-insensitive), on a line by itself.
 
 State is persisted to disk (state.json) after every successful channel
 creation or admin addition, so /resume works even after a full script restart.
@@ -62,8 +57,6 @@ API_HASH = os.getenv("API_HASH")
 SESSION_NAME = os.getenv("SESSION_NAME", "anime_channel_bot")
 
 # Only this Telegram user id may issue commands to the bot.
-# Leave OWNER_ID unset in .env for the very first run -- the bot will print
-# your numeric user id on login so you can add it and restart.
 OWNER_ID = _int_env("OWNER_ID")
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
@@ -195,7 +188,6 @@ async def promote_admins_to_channel(channel_entity, admin_usernames):
         add_admins=False
     )
 
-    # Convert to input channel to prevent casting errors
     input_channel = await client.get_input_entity(channel_entity)
 
     for username in admin_usernames:
@@ -224,7 +216,7 @@ async def promote_admins_to_channel(channel_entity, admin_usernames):
 
 
 # ---------------------------------------------------------------------------
-# Batch processing loop (supports both makechannel and addadmin modes)
+# Batch processing loop
 # ---------------------------------------------------------------------------
 
 async def process_batch(event, state):
@@ -307,7 +299,7 @@ async def process_batch(event, state):
 
 
 # ---------------------------------------------------------------------------
-# Command handlers
+# Command handlers & Wizard steps
 # ---------------------------------------------------------------------------
 
 def is_owner(event):
@@ -332,6 +324,7 @@ async def makechannel_cmd(event):
         "mode": "makechannel",
         "visibility": None,
         "awaiting_visibility": True,
+        "awaiting_admins": False,
         "awaiting_list": False,
         "admin_usernames": [],
         "items": [],
@@ -365,6 +358,7 @@ async def addadmin_command(event):
         "active": True,
         "mode": "addadmin",
         "awaiting_visibility": False,
+        "awaiting_admins": False,
         "awaiting_list": True,
         "admin_usernames": admin_usernames,
         "items": [],
@@ -373,7 +367,7 @@ async def addadmin_command(event):
     save_state(state)
     await event.respond(
         f"✅ Target admins/bots recorded: {', '.join(admin_usernames)}\n\n"
-        "Now send or paste your channel list (channels created previously by the bot, or usernames/IDs/invite links line-by-line)."
+        "Now send or paste your channel list line-by-line."
     )
 
 
@@ -387,23 +381,17 @@ async def visibility_reply(event):
 
     state["visibility"] = event.raw_text.strip().lower()
     state["awaiting_visibility"] = False
-    state["awaiting_list"] = True
+    state["awaiting_admins"] = True
     save_state(state)
 
-    note = ""
-    if state["visibility"] == "public":
-        note = (
-            "\n\nNote: newly created channels are private by default. Making "
-            "one public requires setting a valid, available @username per channel."
-        )
     await event.respond(
-        "Got it. Now send me the anime list (day headers optional, e.g. "
-        "'Monday' on its own line, then names below it)." + note
+        "Got it! Now, which bots or usernames should be added as admins to each channel?\n"
+        "*(Send them separated by spaces like `@Maiilman_robot @Od3nsLinks_bot`, or type `none` if you don't want any)*"
     )
 
 
 @client.on(events.NewMessage())
-async def list_reply(event):
+async def wizard_responses(event):
     if not is_owner(event):
         return
     if event.raw_text.strip().startswith("/"):
@@ -412,22 +400,42 @@ async def list_reply(event):
         return
 
     state = load_state()
-    if not state or not state.get("awaiting_list"):
+    if not state or not state.get("active"):
         return
 
-    items = parse_list(event.raw_text)
-    if not items:
-        await event.respond("Didn't find any items in that message. Try again.")
+    # Step 2b: Capturing Admin Usernames during /makechannel flow
+    if state.get("awaiting_admins"):
+        text = event.raw_text.strip()
+        if text.lower() == "none":
+            state["admin_usernames"] = []
+        else:
+            state["admin_usernames"] = text.split()
+
+        state["awaiting_admins"] = False
+        state["awaiting_list"] = True
+        save_state(state)
+
+        await event.respond(
+            f"✅ Admins saved: {', '.join(state['admin_usernames']) if state['admin_usernames'] else 'None'}\n\n"
+            "Now send or paste your anime list (day headers optional, e.g. 'Monday' on its own line)."
+        )
         return
 
-    for it in items:
-        it["status"] = "pending"
-    state["items"] = items
-    state["awaiting_list"] = False
-    save_state(state)
+    # Step 3: Capturing the Anime List
+    if state.get("awaiting_list"):
+        items = parse_list(event.raw_text)
+        if not items:
+            await event.respond("Didn't find any items in that message. Try again.")
+            return
 
-    await event.respond(f"Starting batch of {len(items)} item(s)...")
-    await process_batch(event, state)
+        for it in items:
+            it["status"] = "pending"
+        state["items"] = items
+        state["awaiting_list"] = False
+        save_state(state)
+
+        await event.respond(f"Starting batch of {len(items)} item(s)...")
+        await process_batch(event, state)
 
 
 @client.on(events.NewMessage(pattern=r"/resume$"))
@@ -438,7 +446,7 @@ async def resume_cmd(event):
     if not state or not state.get("active"):
         await event.respond("No in-progress batch to resume.")
         return
-    if state.get("awaiting_visibility") or state.get("awaiting_list"):
+    if state.get("awaiting_visibility") or state.get("awaiting_admins") or state.get("awaiting_list"):
         await event.respond("Batch isn't ready to resume yet -- finish setup first.")
         return
 
