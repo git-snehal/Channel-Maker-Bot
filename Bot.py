@@ -184,6 +184,20 @@ async def create_one_channel(name, is_private):
 
 async def promote_admins_to_channel(channel_entity, admin_usernames):
     promoted = []
+    admin_rights = ChatAdminRights(
+        change_info=True,
+        post_messages=True,
+        edit_messages=True,
+        delete_messages=True,
+        ban_users=True,
+        invite_users=True,
+        pin_messages=True,
+        add_admins=False
+    )
+
+    # Safely get the input channel entity to prevent casting errors
+    input_channel = await client.get_input_entity(channel_entity)
+
     for username in admin_usernames:
         try:
             user_entity = await client.get_entity(username)
@@ -191,27 +205,21 @@ async def promote_admins_to_channel(channel_entity, admin_usernames):
             # Ensure the bot/user is invited to the channel first
             try:
                 await client(InviteToChannelRequest(
-                    channel=channel_entity,
+                    channel=input_channel,
                     users=[user_entity]
                 ))
             except Exception:
                 pass  # May fail if already a participant, which is fine
 
-            # Use Telethon's built-in high-level helper which handles input casting safely
-            await client.edit_admin(
-                entity=channel_entity,
-                user=user_entity,
-                is_admin=True,
-                change_info=True,
-                post_messages=True,
-                edit_messages=True,
-                delete_messages=True,
-                ban_users=True,
-                invite_users=True,
-                pin_messages=True,
-                add_admins=False,
+            # Safely get the input user entity
+            input_user = await client.get_input_entity(user_entity)
+
+            await client(EditAdminRequest(
+                channel=input_channel,
+                user_id=input_user,
+                admin_rights=admin_rights,
                 rank="Admin"
-            )
+            ))
             promoted.append(username)
         except Exception as e:
             print(f"Failed to add {username} as admin: {e}")
