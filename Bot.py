@@ -64,7 +64,7 @@ OWNER_ID = _int_env("OWNER_ID")
 TARGET_GROUP = os.getenv("TARGET_GROUP")
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
-STICKER_FILE = os.path.join(os.path.dirname(__file__), "sticker_state.json")
+STICKER_PATH = os.path.join(os.path.dirname(__file__), "default_sticker.webp")
 
 # Delay (seconds) between each channel creation -- randomized within range.
 MIN_DELAY = _int_env("MIN_DELAY", 30)
@@ -112,19 +112,9 @@ def clear_state():
 
 
 def load_saved_sticker():
-    if not os.path.exists(STICKER_FILE):
-        return None
-    try:
-        with open(STICKER_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data.get("sticker_id")
-    except Exception:
-        return None
-
-
-def save_sticker_data(media_dict):
-    with open(STICKER_FILE, "w", encoding="utf-8") as f:
-        json.dump({"sticker_id": media_dict}, f, indent=2)
+    if os.path.exists(STICKER_PATH):
+        return STICKER_PATH
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +188,6 @@ async def create_one_channel(name, is_private):
 
 async def promote_admins_to_channel(channel_entity, admin_usernames):
     promoted = []
-    # Fully enabled administrator rights
     admin_rights = ChatAdminRights(
         change_info=True,
         post_messages=True,
@@ -222,7 +211,7 @@ async def promote_admins_to_channel(channel_entity, admin_usernames):
                     users=[user_entity]
                 ))
             except Exception:
-                pass  # May fail if already a participant, which is fine
+                pass
 
             input_user = await client.get_input_entity(user_entity)
 
@@ -244,7 +233,7 @@ async def promote_admins_to_channel(channel_entity, admin_usernames):
 
 async def execute_anime_automation(target_group_entity, anime_name, channel_entity):
     """
-    Sends /a <anime_name> to the target group, listens for the inline response buttons,
+    Sends /a <anime_name> to the target group, polls for the inline response buttons,
     clicks the matching button, waits for the info card to appear, forwards it anonymously
     to the channel, and sends the saved sticker.
     """
@@ -252,54 +241,56 @@ async def execute_anime_automation(target_group_entity, anime_name, channel_enti
         # 1. Send search command
         sent_msg = await client.send_message(target_group_entity, f"/a {anime_name}")
         
-        # 2. Wait for message reply/buttons from search bot
-        await asyncio.sleep(3)
-        
-        # Fetch recent messages in the group to find the inline buttons message
-        messages = await client.get_messages(target_group_entity, limit=5)
+        # 2. Poll for the search bot's inline keyboard response message
         target_msg = None
-        for msg in messages:
-            if msg.reply_markup and hasattr(msg.reply_markup, 'rows'):
-                target_msg = msg
+        for _ in range(12):  # Try for up to 6 seconds
+            await asyncio.sleep(0.5)
+            messages = await client.get_messages(target_group_entity, limit=5)
+            for msg in messages:
+                if msg.id > sent_msg.id and msg.reply_markup and hasattr(msg.reply_markup, 'rows'):
+                    target_msg = msg
+                    break
+            if target_msg:
                 break
         
         if not target_msg:
-            print(f"Could not find inline result for '{anime_name}'")
+            print(f"Could not find inline result message for '{anime_name}'")
             return False
 
-        # 3. Find and click the button that matches the anime name
-        button_to_click = None
+        # 3. Find and click the button matching the anime name
+        button_clicked = False
         for row in target_msg.reply_markup.rows:
             for button in row.buttons:
                 if anime_name.lower() in button.text.lower():
-                    button_to_click = button
+                    await target_msg.click(text=button.text)
+                    button_clicked = True
                     break
-            if button_to_click:
+            if button_clicked:
                 break
         
         # Fallback to the first button if exact name match isn't found
-        if not button_to_click and target_msg.reply_markup.rows:
-            button_to_click = target_msg.reply_markup.rows[0].buttons[0]
+        if not button_clicked and target_msg.reply_markup.rows:
+            await target_msg.click(0, 0)
+            button_clicked = True
 
-        if button_to_click:
-            await target_msg.click(data=button_to_click.data)
-        else:
+        if not button_clicked:
             print(f"No clickable button found for '{anime_name}'")
             return False
 
-        # 4. Wait a few seconds for the other bot to post the final info card
-        await asyncio.sleep(4)
-
-        # 5. Grab the latest message in the group which should be the info card
-        recent_msgs = await client.get_messages(target_group_entity, limit=3)
+        # 4. Poll for the final info card posted by the search bot
         info_card_msg = None
-        for msg in recent_msgs:
-            if msg.id != sent_msg.id and msg.id != target_msg.id:
-                info_card_msg = msg
+        for _ in range(16):  # Try for up to 8 seconds
+            await asyncio.sleep(0.5)
+            recent_msgs = await client.get_messages(target_group_entity, limit=5)
+            for msg in recent_msgs:
+                if msg.id > target_msg.id and (msg.media or msg.text):
+                    info_card_msg = msg
+                    break
+            if info_card_msg:
                 break
 
         if info_card_msg:
-            # Forward the info card to the newly created channel anonymously (hiding sender ID)
+            # Forward the info card to the newly created channel anonymously
             await client.forward_messages(channel_entity, info_card_msg, drop_author=True)
             
             # Send saved sticker if available
@@ -311,6 +302,8 @@ async def execute_anime_automation(target_group_entity, anime_name, channel_enti
                     print(f"Failed to send saved sticker: {ex}")
             
             return True
+        else:
+            print(f"Info card message not found after clicking button for '{anime_name}'")
 
     except Exception as e:
         print(f"Automation sequence failed for {anime_name}: {e}")
@@ -331,7 +324,6 @@ async def process_batch(event, state):
     target_group_entity = None
     if mode == "makechannel" and TARGET_GROUP:
         try:
-            # Parse integer safely if it's a channel/group ID string like "-100..."
             entity_id = int(TARGET_GROUP) if TARGET_GROUP.lstrip("-").isdigit() else TARGET_GROUP
             target_group_entity = await client.get_entity(entity_id)
         except Exception as e:
@@ -353,7 +345,6 @@ async def process_batch(event, state):
                 if admin_usernames:
                     promoted = await promote_admins_to_channel(channel_entity, admin_usernames)
 
-                # Execute automated /a search and anonymous forwarding sequence if target group is set
                 automation_success = False
                 if target_group_entity:
                     await event.respond(f"🔍 Automating search & post for: {name}...")
@@ -448,7 +439,7 @@ async def setsticker_cmd(event):
         await event.respond("❌ The message you replied to is not a valid sticker.")
         return
 
-    save_sticker_data(reply.media.to_dict())
+    await reply.download_media(file=STICKER_PATH)
     await event.respond("✅ Default sticker saved successfully! It will now be sent after every anime info card.")
 
 
