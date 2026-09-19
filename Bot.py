@@ -10,22 +10,11 @@ Commands (work in your own Saved Messages / any admin PM with yourself):
   /resume            Resume a batch that was interrupted (e.g. by a flood wait).
   /status            Show current progress of an in-progress batch, if any.
   /cancel            Discard the current active batch.
-
-List format example (after setup):
-
-    Monday
-    Black Clover
-    Reincarnated as a Sword
-    Cyberpunk
-    Tuesday
-    Jujutsu Kaisen
-
-State is persisted to disk (state.json) after every successful channel
-creation or admin addition, so /resume works even after a full script restart.
 """
 
 import asyncio
 import json
+import logging
 import os
 import random
 import re
@@ -43,7 +32,16 @@ from telethon.tl.functions.messages import ExportChatInviteRequest
 from telethon.tl.types import ChatAdminRights, DocumentAttributeSticker
 
 # ---------------------------------------------------------------------------
-# CONFIG  -- loaded from a .env file (see .env.example) instead of hardcoded
+# Logging Setup
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger("AnimeChannelBot")
+
+# ---------------------------------------------------------------------------
+# CONFIG
 # ---------------------------------------------------------------------------
 load_dotenv()
 
@@ -56,30 +54,22 @@ def _int_env(name, default=None):
 API_ID = _int_env("API_ID")
 API_HASH = os.getenv("API_HASH")
 SESSION_NAME = os.getenv("SESSION_NAME", "anime_channel_bot")
-
-# Only this Telegram user id may issue commands to the bot.
 OWNER_ID = _int_env("OWNER_ID")
-
-# Target group for /a automated searches (can be a username like @group or id like -100...)
 TARGET_GROUP = os.getenv("TARGET_GROUP")
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
 STICKER_PATH = os.path.join(os.path.dirname(__file__), "default_sticker.webp")
 
-# Delay (seconds) between each channel creation -- randomized within range.
-MIN_DELAY = _int_env("MIN_DELAY", 30)
-MAX_DELAY = _int_env("MAX_DELAY", 60)
+# Slower delays to completely prevent flood waits
+MIN_DELAY = _int_env("MIN_DELAY", 45)
+MAX_DELAY = _int_env("MAX_DELAY", 75)
 
-# After this many actions in a row, take a longer cooldown break.
-COOLDOWN_EVERY = _int_env("COOLDOWN_EVERY", 8)
-COOLDOWN_MIN = _int_env("COOLDOWN_MIN", 300)    # 5 minutes
-COOLDOWN_MAX = _int_env("COOLDOWN_MAX", 600)    # 10 minutes
+COOLDOWN_EVERY = _int_env("COOLDOWN_EVERY", 5)
+COOLDOWN_MIN = _int_env("COOLDOWN_MIN", 300)
+COOLDOWN_MAX = _int_env("COOLDOWN_MAX", 600)
 
 if API_ID is None or not API_HASH:
-    raise SystemExit(
-        "Missing API_ID / API_HASH. Copy .env.example to .env and fill them "
-        "in before running."
-    )
+    raise SystemExit("Missing API_ID / API_HASH in .env file.")
 
 DAY_NAMES = {
     "monday", "tuesday", "wednesday", "thursday",
@@ -118,7 +108,7 @@ def load_saved_sticker():
 
 
 # ---------------------------------------------------------------------------
-# Parsing the anime list with day headers
+# Parsing list & Formatting Commands
 # ---------------------------------------------------------------------------
 
 def parse_list(text):
@@ -135,9 +125,18 @@ def parse_list(text):
     return items
 
 
-# ---------------------------------------------------------------------------
-# Report formatting
-# ---------------------------------------------------------------------------
+def generate_anime_commands(full_id, name):
+    parts = name.strip().split()
+    if len(parts) > 1:
+        first_field = parts[-1]
+    else:
+        first_field = name.strip()
+    
+    return [
+        f"/add_channel {full_id} F",
+        f"/add_anime {first_field}, {name}, {full_id}",
+    ]
+
 
 def format_report(items):
     lines = []
@@ -166,6 +165,7 @@ def format_report(items):
 # ---------------------------------------------------------------------------
 
 async def create_one_channel(name, is_private):
+    logger.info(f"Creating channel: '{name}' (Private={is_private})")
     result = await client(CreateChannelRequest(
         title=name,
         about="",
@@ -178,16 +178,13 @@ async def create_one_channel(name, is_private):
     invite = await client(ExportChatInviteRequest(peer=new_channel))
     invite_link = invite.link
 
-    commands = [
-        f"/add_channel {full_id} F",
-        f"/add_anime {full_id} {name}",
-    ]
-
+    commands = generate_anime_commands(full_id, name)
     return full_id, new_channel, commands, invite_link
 
 
 async def promote_admins_to_channel(channel_entity, admin_usernames):
     promoted = []
+    # Fully enabled administrator rights including Manage Direct Messages (other=True)
     admin_rights = ChatAdminRights(
         change_info=True,
         post_messages=True,
@@ -197,13 +194,15 @@ async def promote_admins_to_channel(channel_entity, admin_usernames):
         invite_users=True,
         pin_messages=True,
         add_admins=True,
-        manage_call=True
+        manage_call=True,
+        other=True  # Enables Manage Direct Messages & Welcome Messages
     )
 
     input_channel = await client.get_input_entity(channel_entity)
 
     for username in admin_usernames:
         try:
+            logger.info(f"Adding admin {username} to channel...")
             user_entity = await client.get_entity(username)
             try:
                 await client(InviteToChannelRequest(
@@ -222,29 +221,30 @@ async def promote_admins_to_channel(channel_entity, admin_usernames):
                 rank="Admin"
             ))
             promoted.append(username)
+            await asyncio.sleep(2)  # Pause between admin promotions
         except Exception as e:
-            print(f"Failed to add {username} as admin: {e}")
+            logger.error(f"Failed to add {username} as admin: {e}")
     return promoted
 
 
 # ---------------------------------------------------------------------------
-# Automated Search & Forward Sequence in the Target Group
+# Automated Search & Forward Sequence (Slowed & Safe)
 # ---------------------------------------------------------------------------
 
 async def execute_anime_automation(target_group_entity, anime_name, channel_entity):
     """
-    Sends /a <anime_name> to the target group, polls for the inline response buttons,
-    clicks the matching button, waits for the info card to appear, forwards it anonymously
-    to the channel, and sends the saved sticker.
+    Sends /a <anime_name> to the target group slowly, polls for response,
+    clicks the button, waits safely, forwards anonymously, and sends sticker.
     """
     try:
-        # 1. Send search command
+        logger.info(f"Automation: Sending search query for '{anime_name}'")
         sent_msg = await client.send_message(target_group_entity, f"/a {anime_name}")
+        await asyncio.sleep(3)  # Gentle wait for bot response
         
-        # 2. Poll for the search bot's inline keyboard response message
+        # Poll for inline keyboard response message
         target_msg = None
-        for _ in range(12):  # Try for up to 6 seconds
-            await asyncio.sleep(0.5)
+        for _ in range(16):
+            await asyncio.sleep(0.7)
             messages = await client.get_messages(target_group_entity, limit=5)
             for msg in messages:
                 if msg.id > sent_msg.id and msg.reply_markup and hasattr(msg.reply_markup, 'rows'):
@@ -254,10 +254,10 @@ async def execute_anime_automation(target_group_entity, anime_name, channel_enti
                 break
         
         if not target_msg:
-            print(f"Could not find inline result message for '{anime_name}'")
+            logger.warning(f"Automation: Could not find inline result message for '{anime_name}'")
             return False
 
-        # 3. Find and click the button matching the anime name
+        # Click matching button
         button_clicked = False
         for row in target_msg.reply_markup.rows:
             for button in row.buttons:
@@ -268,19 +268,21 @@ async def execute_anime_automation(target_group_entity, anime_name, channel_enti
             if button_clicked:
                 break
         
-        # Fallback to the first button if exact name match isn't found
         if not button_clicked and target_msg.reply_markup.rows:
             await target_msg.click(0, 0)
             button_clicked = True
 
         if not button_clicked:
-            print(f"No clickable button found for '{anime_name}'")
+            logger.warning(f"Automation: No clickable button found for '{anime_name}'")
             return False
 
-        # 4. Poll for the final info card posted by the search bot
+        logger.info(f"Automation: Clicked button for '{anime_name}', waiting for info card...")
+        await asyncio.sleep(4)  # Wait for search bot to generate info card
+
+        # Poll for final info card
         info_card_msg = None
-        for _ in range(16):  # Try for up to 8 seconds
-            await asyncio.sleep(0.5)
+        for _ in range(20):
+            await asyncio.sleep(0.7)
             recent_msgs = await client.get_messages(target_group_entity, limit=5)
             for msg in recent_msgs:
                 if msg.id > target_msg.id and (msg.media or msg.text):
@@ -290,23 +292,24 @@ async def execute_anime_automation(target_group_entity, anime_name, channel_enti
                 break
 
         if info_card_msg:
-            # Forward the info card to the newly created channel anonymously
+            logger.info(f"Automation: Forwarding info card anonymously for '{anime_name}'")
             await client.forward_messages(channel_entity, info_card_msg, drop_author=True)
+            await asyncio.sleep(2)
             
-            # Send saved sticker if available
             saved_sticker = load_saved_sticker()
             if saved_sticker:
                 try:
                     await client.send_file(channel_entity, saved_sticker)
+                    logger.info("Automation: Sent default sticker.")
                 except Exception as ex:
-                    print(f"Failed to send saved sticker: {ex}")
+                    logger.error(f"Failed to send saved sticker: {ex}")
             
             return True
         else:
-            print(f"Info card message not found after clicking button for '{anime_name}'")
+            logger.warning(f"Automation: Info card message not found for '{anime_name}'")
 
     except Exception as e:
-        print(f"Automation sequence failed for {anime_name}: {e}")
+        logger.error(f"Automation sequence failed for {anime_name}: {e}")
     
     return False
 
@@ -327,7 +330,8 @@ async def process_batch(event, state):
             entity_id = int(TARGET_GROUP) if TARGET_GROUP.lstrip("-").isdigit() else TARGET_GROUP
             target_group_entity = await client.get_entity(entity_id)
         except Exception as e:
-            await event.respond(f"❌ Could not resolve target search group '{TARGET_GROUP}' from .env: {e}")
+            logger.error(f"Could not resolve target group '{TARGET_GROUP}': {e}")
+            await event.respond(f"❌ Could not resolve target search group '{TARGET_GROUP}': {e}")
             return
 
     for item in items:
@@ -373,17 +377,18 @@ async def process_batch(event, state):
 
         except FloodWaitError as e:
             wait_seconds = e.seconds
+            logger.warning(f"FloodWait hit! Sleeping for {wait_seconds} seconds.")
             save_state(state)
             await event.respond(
-                f"⚠️ Flood wait hit after processing up to (but not including) "
-                f"'{name}'.\nWaiting {wait_seconds}s (~{wait_seconds // 60} min). "
-                f"I'll message you when it's clear -- then send /resume."
+                f"⚠️ Telegram Flood Wait hit. Pausing for {wait_seconds}s "
+                f"(~{wait_seconds // 60} min). Send /resume afterwards."
             )
             await asyncio.sleep(wait_seconds)
             await event.respond("✅ Flood wait cleared. Send /resume to continue.")
             return
 
         except Exception as e:
+            logger.error(f"Error processing '{name}': {e}")
             await event.respond(f"❌ Error processing '{name}': {e}")
             continue
 
@@ -395,23 +400,27 @@ async def process_batch(event, state):
             cooldown = random.uniform(COOLDOWN_MIN, COOLDOWN_MAX)
             state["created_count_since_cooldown"] = 0
             save_state(state)
+            logger.info(f"Taking a cooldown break for {int(cooldown // 60)} minutes...")
             await event.respond(
-                f"⏸ Taking a short cooldown break (~{int(cooldown // 60)} min) "
-                f"after {COOLDOWN_EVERY} actions..."
+                f"⏸ Taking a safe cooldown break (~{int(cooldown // 60)} min) "
+                f"to prevent flood limits..."
             )
             await asyncio.sleep(cooldown)
         else:
-            await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
+            delay = random.uniform(MIN_DELAY, MAX_DELAY)
+            logger.info(f"Waiting {int(delay)}s before next channel...")
+            await asyncio.sleep(delay)
 
     state["active"] = False
     save_state(state)
     report = format_report(state["items"])
+    logger.info("Batch processing complete!")
     await event.respond("🎉 Batch processing complete!\n\n" + report)
     clear_state()
 
 
 # ---------------------------------------------------------------------------
-# Command handlers & Wizard steps
+# Command Handlers & Wizard
 # ---------------------------------------------------------------------------
 
 def is_owner(event):
@@ -440,7 +449,8 @@ async def setsticker_cmd(event):
         return
 
     await reply.download_media(file=STICKER_PATH)
-    await event.respond("✅ Default sticker saved successfully! It will now be sent after every anime info card.")
+    logger.info("Default sticker updated successfully.")
+    await event.respond("✅ Default sticker saved successfully!")
 
 
 @client.on(events.NewMessage(pattern=r"/makechannel$"))
@@ -450,10 +460,7 @@ async def makechannel_cmd(event):
 
     existing = load_state()
     if existing and existing.get("active"):
-        await event.respond(
-            "There's already an in-progress batch. Send /resume to continue it, "
-            "or /cancel to discard it before starting a new one."
-        )
+        await event.respond("There's already an active batch. Send /resume or /cancel first.")
         return
 
     state = {
@@ -478,18 +485,11 @@ async def addadmin_command(event):
 
     existing = load_state()
     if existing and existing.get("active"):
-        await event.respond(
-            "There's already an in-progress batch. Send /resume to continue it, "
-            "or /cancel to discard it first."
-        )
+        await event.respond("There's already an active batch. Send /resume or /cancel first.")
         return
 
     raw_args = event.pattern_match.group(1).strip()
     admin_usernames = raw_args.split()
-
-    if not admin_usernames:
-        await event.respond("❌ Please provide at least one username/bot handle. Example: `/addadmin @xyz @yzx`")
-        return
 
     state = {
         "active": True,
@@ -502,10 +502,7 @@ async def addadmin_command(event):
         "created_count_since_cooldown": 0,
     }
     save_state(state)
-    await event.respond(
-        f"✅ Target admins/bots recorded: {', '.join(admin_usernames)}\n\n"
-        "Now send or paste your channel list line-by-line."
-    )
+    await event.respond(f"✅ Admins recorded: {', '.join(admin_usernames)}\n\nNow send your channel list.")
 
 
 @client.on(events.NewMessage(pattern=r"(?i)^(private|public)$"))
@@ -521,10 +518,7 @@ async def visibility_reply(event):
     state["awaiting_admins"] = True
     save_state(state)
 
-    await event.respond(
-        "Got it! Now, which bots or usernames should be added as admins to each channel?\n"
-        "*(Send them separated by spaces like `@Maiilman_robot @Od3nsLinks_bot`, or type `none`)*"
-    )
+    await event.respond("Got it! Which bots/usernames should be added as admins? (Or type `none`)")
 
 
 @client.on(events.NewMessage())
@@ -540,7 +534,6 @@ async def wizard_responses(event):
     if not state or not state.get("active"):
         return
 
-    # Step 2: Capturing Admin Usernames
     if state.get("awaiting_admins"):
         text = event.raw_text.strip()
         if text.lower() == "none":
@@ -551,18 +544,13 @@ async def wizard_responses(event):
         state["awaiting_admins"] = False
         state["awaiting_list"] = True
         save_state(state)
-
-        await event.respond(
-            f"✅ Admins saved: {', '.join(state['admin_usernames']) if state['admin_usernames'] else 'None'}\n\n"
-            "Now send or paste your anime list (day headers optional, e.g. 'Monday' on its own line)."
-        )
+        await event.respond("✅ Admins saved. Now send or paste your anime list line-by-line.")
         return
 
-    # Step 3: Capturing the Anime List
     if state.get("awaiting_list"):
         items = parse_list(event.raw_text)
         if not items:
-            await event.respond("Didn't find any items in that message. Try again.")
+            await event.respond("No items found. Try again.")
             return
 
         for it in items:
@@ -571,7 +559,7 @@ async def wizard_responses(event):
         state["awaiting_list"] = False
         save_state(state)
 
-        await event.respond(f"Starting batch of {len(items)} item(s) with automation...")
+        await event.respond(f"Starting batch of {len(items)} item(s) safely with slow delays...")
         await process_batch(event, state)
 
 
@@ -581,12 +569,8 @@ async def resume_cmd(event):
         return
     state = load_state()
     if not state or not state.get("active"):
-        await event.respond("No in-progress batch to resume.")
+        await event.respond("No batch to resume.")
         return
-    if state.get("awaiting_visibility") or state.get("awaiting_admins") or state.get("awaiting_list"):
-        await event.respond("Batch isn't ready to resume yet -- finish setup first.")
-        return
-
     remaining = sum(1 for i in state["items"] if i["status"] != "done")
     await event.respond(f"Resuming -- {remaining} item(s) left.")
     await process_batch(event, state)
@@ -602,7 +586,7 @@ async def status_cmd(event):
         return
     done = sum(1 for i in state["items"] if i["status"] == "done")
     total = len(state["items"])
-    await event.respond(f"Batch in progress: {done}/{total} completed.")
+    await event.respond(f"Progress: {done}/{total} completed.")
 
 
 @client.on(events.NewMessage(pattern=r"/cancel$"))
@@ -624,14 +608,10 @@ async def cancel_cmd(event):
 async def main():
     await client.start()
     me = await client.get_me()
-    print(f"Logged in as {me.first_name} (id={me.id})")
+    logger.info(f"Logged in as {me.first_name} (id={me.id})")
     if OWNER_ID is None:
-        print(
-            "\n*** OWNER_ID is not set. ***\n"
-            f"Your numeric user id is: {me.id}\n"
-            f"Add OWNER_ID={me.id} to your .env file, then restart.\n"
-        )
-    print("Bot is running. Send commands from your own account to begin.")
+        logger.warning(f"OWNER_ID is not set. Your user ID is {me.id}")
+    logger.info("Bot is running and ready.")
     await client.run_until_disconnected()
 
 
