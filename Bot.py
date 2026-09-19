@@ -4,7 +4,7 @@ Anime Channel Creator Userbot
 
 Commands (work in your own Saved Messages / any admin PM with yourself):
 
-  /makechannel       Start a new batch. Bot asks Private/Public, Target Group for /a searches, Admins, then your anime list.
+  /makechannel       Start a new batch. Bot asks Private/Public, Admins, then your anime list.
   /addadmin          Start a batch to add specified admins/bots to a list of channels.
   /setsticker        Reply to a sticker to save it as the default sticker to post after anime info cards.
   /resume            Resume a batch that was interrupted (e.g. by a flood wait).
@@ -59,6 +59,9 @@ SESSION_NAME = os.getenv("SESSION_NAME", "anime_channel_bot")
 
 # Only this Telegram user id may issue commands to the bot.
 OWNER_ID = _int_env("OWNER_ID")
+
+# Target group for /a automated searches (can be a username like @group or id like -100...)
+TARGET_GROUP = os.getenv("TARGET_GROUP")
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
 STICKER_FILE = os.path.join(os.path.dirname(__file__), "sticker_state.json")
@@ -324,14 +327,15 @@ async def process_batch(event, state):
     mode = state.get("mode", "makechannel")
     created_since_cooldown = state.get("created_count_since_cooldown", 0)
     admin_usernames = state.get("admin_usernames", [])
-    target_group = state.get("target_group")
 
     target_group_entity = None
-    if mode == "makechannel" and target_group:
+    if mode == "makechannel" and TARGET_GROUP:
         try:
-            target_group_entity = await client.get_entity(target_group)
+            # Parse integer safely if it's a channel/group ID string like "-100..."
+            entity_id = int(TARGET_GROUP) if TARGET_GROUP.lstrip("-").isdigit() else TARGET_GROUP
+            target_group_entity = await client.get_entity(entity_id)
         except Exception as e:
-            await event.respond(f"❌ Could not resolve target search group '{target_group}': {e}")
+            await event.respond(f"❌ Could not resolve target search group '{TARGET_GROUP}' from .env: {e}")
             return
 
     for item in items:
@@ -466,10 +470,8 @@ async def makechannel_cmd(event):
         "mode": "makechannel",
         "visibility": None,
         "awaiting_visibility": True,
-        "awaiting_target_group": False,
         "awaiting_admins": False,
         "awaiting_list": False,
-        "target_group": None,
         "admin_usernames": [],
         "items": [],
         "created_count_since_cooldown": 0,
@@ -502,7 +504,6 @@ async def addadmin_command(event):
         "active": True,
         "mode": "addadmin",
         "awaiting_visibility": False,
-        "awaiting_target_group": False,
         "awaiting_admins": False,
         "awaiting_list": True,
         "admin_usernames": admin_usernames,
@@ -526,12 +527,12 @@ async def visibility_reply(event):
 
     state["visibility"] = event.raw_text.strip().lower()
     state["awaiting_visibility"] = False
-    state["awaiting_target_group"] = True
+    state["awaiting_admins"] = True
     save_state(state)
 
     await event.respond(
-        "Got it! Now, send the **Group Username or ID** where the bot should send `/a <anime name>` for automated searches.\n"
-        "*(Example: `@myanimegroup` or `-100xxxxxxxxxx`)*"
+        "Got it! Now, which bots or usernames should be added as admins to each channel?\n"
+        "*(Send them separated by spaces like `@Maiilman_robot @Od3nsLinks_bot`, or type `none`)*"
     )
 
 
@@ -548,21 +549,7 @@ async def wizard_responses(event):
     if not state or not state.get("active"):
         return
 
-    # Step 2: Capturing Target Group
-    if state.get("awaiting_target_group"):
-        state["target_group"] = event.raw_text.strip()
-        state["awaiting_target_group"] = False
-        state["awaiting_admins"] = True
-        save_state(state)
-
-        await event.respond(
-            f"✅ Target group recorded: `{state['target_group']}`\n\n"
-            "Now, which bots or usernames should be added as admins to each channel?\n"
-            "*(Send them separated by spaces like `@Maiilman_robot @Od3nsLinks_bot`, or type `none`)*"
-        )
-        return
-
-    # Step 3: Capturing Admin Usernames
+    # Step 2: Capturing Admin Usernames
     if state.get("awaiting_admins"):
         text = event.raw_text.strip()
         if text.lower() == "none":
@@ -580,7 +567,7 @@ async def wizard_responses(event):
         )
         return
 
-    # Step 4: Capturing the Anime List
+    # Step 3: Capturing the Anime List
     if state.get("awaiting_list"):
         items = parse_list(event.raw_text)
         if not items:
@@ -605,7 +592,7 @@ async def resume_cmd(event):
     if not state or not state.get("active"):
         await event.respond("No in-progress batch to resume.")
         return
-    if state.get("awaiting_visibility") or state.get("awaiting_target_group") or state.get("awaiting_admins") or state.get("awaiting_list"):
+    if state.get("awaiting_visibility") or state.get("awaiting_admins") or state.get("awaiting_list"):
         await event.respond("Batch isn't ready to resume yet -- finish setup first.")
         return
 
